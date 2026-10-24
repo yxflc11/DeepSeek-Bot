@@ -47,6 +47,32 @@ At every start the Host puts these three bundles at the head of the profile's bu
 
 ## Check a change
 
+### Startup readiness
+
+The desktop window opens its Host page only after the required session services and the Bot API
+are available. DSH can keep its web server running when an optional plugin failed; a listening
+port alone is therefore not enough. The app checks `workspaceRegistry` and `sessionController`,
+then uses Connection's public shared Fetch handler to call the Bot API's existing `efforts`
+endpoint with an empty model reference. This waits for the team's normal store initialization,
+without creating a Bot, selecting a model, or making a model request. The result must be a small,
+successful JSON response. An unrelated optional plugin failure does not by itself block startup.
+
+The API check has a 30-second deadline and the normal Host launch a two-minute deadline. A failure
+uses the existing startup error dialog and stops the Host; a late ready message cannot reopen a
+stopped launch. The first-run import check keeps its separate, potentially longer lifetime.
+
+If the dialog names `workspaceRegistry` or `sessionController`, inspect the Host's startup
+diagnostics for the original dependency failure. For example, DSH rejects a session log whose
+stored identity does not match its directory. Quit the app before moving any manually archived
+session folders, and keep backups outside the data location's `sessions/` directory. Do not edit
+the logs, delete them, or bypass their integrity checks. The readiness check does not repair or
+discard user data. See [issue #516](https://github.com/Fei2411/DeepSeek-Bot/issues/516).
+
+`node --test test/host-readiness.test.mjs test/host-process.test.mjs test/host-startup.test.mjs`
+covers bounded probes, startup/shutdown races, and real DSH startup with disposable session logs.
+
+### Existing checks
+
 `npm test` checks the composition of the profile, the import on throwaway folders, the first-run check on a chat with a record that the pinned DSH does not know, and that every package the app runs on is a dependency (see [Package](#package)).
 
 `scripts/shot.mjs` starts the app on throwaway folders, saves a screenshot of its window, prints the page text, closes the window the way a user does and waits until the app exits. Use the mock model of the plugin, `../ds-bot/dev/mock-llm.mjs` (`MOCK_PORT=<port> node ../ds-bot/dev/mock-llm.mjs`).

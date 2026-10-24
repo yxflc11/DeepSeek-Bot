@@ -9,6 +9,7 @@ import { runProfile } from '@deepseek-ai/dsh/profile-boot'
 import { CHECK_PROFILE, INSTALL_ANCHOR, loadAppProfile, loadCheckProfile, PROFILE } from './profile.mjs'
 import { reconcileSearchSelector } from './search-patch.mjs'
 import { unreadableSessions } from './session-check.mjs'
+import { checkBotReady } from './host-readiness.mjs'
 
 const MAX_FATAL_DIAGNOSTIC_CHARS = 64 * 1024
 
@@ -33,7 +34,9 @@ async function main() {
     }),
   })
   let stopping
+  const startup = new AbortController()
   const stop = () => stopping ??= (async () => {
+    startup.abort(new Error('The DSH Host startup was stopped.'))
     // A Host that failed to boot has nothing to shut down; the shell already has the failure.
     const running = await application.catch(() => undefined)
     await running?.shutdown.shutdown(0)
@@ -43,6 +46,7 @@ async function main() {
   process.on('message', (message) => { if (message?.type === 'shutdown') void stop() })
   process.once('disconnect', () => { void stop() })
   const { ctx } = await application
+  startup.signal.throwIfAborted()
   if (check !== undefined) {
     const persistence = ctx.get('sessionPersistence')
     if (persistence === undefined) throw new Error(`The profile in ${profile.dir} does not store Sessions.`)
@@ -52,6 +56,8 @@ async function main() {
   const [webServer, connection] = [ctx.get('webServer'), ctx.get('connection')]
   // A profile patch can turn these rows off; then the window has nothing to talk to.
   if (webServer === undefined || connection === undefined) throw new Error(`The profile in ${profile.dir} does not start the engine's web server and connection.`)
+  await checkBotReady(ctx, { signal: startup.signal })
+  startup.signal.throwIfAborted()
   const url = connection.authenticatedUrl(`http://127.0.0.1:${String(webServer.port)}`)
   await send({ type: 'ready', url, injections: webServer.collectIndexInjections() })
 }

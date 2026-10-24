@@ -3,6 +3,7 @@
 import { spawn } from 'node:child_process'
 
 const STDERR_TAIL_CHARS = 8 * 1024
+const STARTUP_TIMEOUT_MS = 120_000
 
 // The web server prints its launch URL, and the launch token in it opens the Host.
 const redact = (text) => text.replace(/([?&]token=)[^&\s]+/gu, '$1<hidden>')
@@ -20,9 +21,12 @@ export class HostProcess {
   #stderr = ''
   #stopping = false
   #failed = false
+  #timer
+  #reject
+  #stop
 
   /**
-   * @param {{ entry: string, cwd: string, env: NodeJS.ProcessEnv, pnpm: string, onFailure: (error: Error) => void }} options
+   * @param {{ entry: string, cwd: string, env: NodeJS.ProcessEnv, pnpm: string, onFailure: (error: Error) => void, startupTimeoutMs?: number }} options
    *   `onFailure` receives the first unexpected failure, also after the Host was ready.
    */
   constructor(options) { this.#options = options }
@@ -33,6 +37,7 @@ export class HostProcess {
    */
   start() {
     this.#ready ??= new Promise((resolve, reject) => {
+      this.#reject = reject
       const { entry, cwd, env, pnpm } = this.#options
       const child = spawn(process.execPath, ['--expose-internals', entry, pnpm], {
         cwd, env: { ...env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
@@ -46,37 +51,62 @@ export class HostProcess {
         this.#stderr = (this.#stderr + chunk).slice(-STDERR_TAIL_CHARS)
       })
       child.on('message', (message) => {
-        if (message?.type === 'ready') resolve({ url: message.url, injections: message.injections })
-        else if (message?.type === 'checked') resolve({ unreadable: message.unreadable })
+        if (this.#stopping || this.#failed) return
+        if (message?.type === 'ready' || message?.type === 'checked') {
+          clearTimeout(this.#timer)
+          this.#reject = undefined
+          resolve(message.type === 'ready' ? { url: message.url, injections: message.injections } : { unreadable: message.unreadable })
+        }
         else if (message?.type === 'fatal') this.#fail(new Error(message.message), reject)
       })
       child.once('error', (error) => { this.#fail(error, reject) })
       this.#exit = new Promise((done) => {
-        child.once('close', (code) => {
+        // A descendant can inherit the log pipes. Its lifetime must not delay Host exit.
+        child.once('exit', (code) => {
           const tail = redact(this.#stderr.trim())
           this.#fail(new Error(`The DSH Host stopped (exit ${String(code)})${tail === '' ? '' : `:\n${tail}`}`), reject)
           done()
         })
+        child.once('error', () => { if (child.pid === undefined) done() })
       })
+      // The import check reads every retained chat, so it keeps its separate lifetime.
+      if (!env.DS_BOT_CHECK) this.#timer = setTimeout(() => {
+        this.#fail(new Error('The DSH Host did not become ready before the startup timeout. Review the Host startup diagnostics.'), reject)
+      }, this.#options.startupTimeoutMs ?? STARTUP_TIMEOUT_MS)
     })
     return this.#ready
   }
 
   /** Ask the Host to shut down, then end it if it does not exit in time. */
-  async stop() {
+  stop() {
+    return this.#stop ??= this.#stopChild()
+  }
+
+  async #stopChild() {
     const child = this.#child
     if (child === undefined) return
     this.#stopping = true
-    if (child.connected) child.send({ type: 'shutdown' }, (error) => { if (error) console.error(error) })
+    clearTimeout(this.#timer)
+    this.#reject?.(new Error('The DSH Host startup was stopped.'))
+    this.#reject = undefined
+    if (child.pid !== undefined && child.connected) child.send({ type: 'shutdown' }, (error) => { if (error) console.error(error) })
     if (!await settlesWithin(this.#exit, 10_000)) child.kill()
-    if (!await settlesWithin(this.#exit, 5_000)) child.kill('SIGKILL')
+    if (!await settlesWithin(this.#exit, 5_000)) {
+      child.kill('SIGKILL')
+      await this.#exit
+    }
+    child.stdout.destroy()
+    child.stderr.destroy()
     this.#child = undefined
   }
 
   #fail(error, reject) {
+    clearTimeout(this.#timer)
+    this.#reject = undefined
     reject(error)
     if (this.#failed || this.#stopping) return
     this.#failed = true
+    void this.stop()
     this.#options.onFailure(error)
   }
 }
